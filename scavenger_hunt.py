@@ -61,9 +61,8 @@ def listen_for_mqtt_credentials(cfg: dict) -> dict:
     """
     from paho.mqtt import client as mqtt_client
 
-    host = cfg.get("influx_url", "challenge.prekit.ch").replace(
-        ("http", "https"), "wss"
-    ).split("//")[0].split(":")[0].split("/")[0] or "challenge.prekit.ch"
+    influx_url = cfg.get("influx_url") or "http://challenge.prekit.ch:8086"
+    host = influx_url.replace("http://", "").replace("https://", "").split("//")[0].split(":")[0].split("/")[0] or "challenge.prekit.ch"
 
     user = cfg.get("mqtt_user") or "alpamayo"
     pw   = cfg.get("mqtt_pass")  or "alpamayo"
