@@ -166,7 +166,7 @@ def main():
     log.info("Initial watchdog value: %s", initial)
 
     # 5. Measurement name (use initials — replace here, or pass via env)
-    measurement = "TP"          # ← YOUR INITIALS  (or "auto_measurement")
+    measurement = "AK"          # AlpaKralle
 
     # 6. 60-second logging loop
     start = time.time()
