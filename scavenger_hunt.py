@@ -83,7 +83,6 @@ def extract_config_from_opcua() -> dict:
             log.info("  OPC UA  %-14s → %s", key, val)
         else:
             log.error("  Could not read OPC UA node %s", key)
-            # Keep trying to get remaining values
             ua = get_ua_client()
     
     try:
@@ -204,31 +203,62 @@ def main():
     duration = 60
     point_count = 0
     
-    # Connect fresh for the monitoring phase
-    ua = get_ua_client()
+    # Try to connect to OPC UA for monitoring with exponential backoff
+    # Server might crash between config-read and monitoring phase
+    ua = None
+    reconnect_delay = 1
+    for attempt in range(1, 31):
+        try:
+            ua = get_ua_client()
+            log.info("OPC UA connected for monitoring (attempt %d)", attempt)
+            break
+        except Exception as exc:
+            log.warning("OPC UA connect failed (attempt %d): %s", attempt, exc)
+            if attempt < 30:
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 8)
     
+    if ua is None:
+        log.error("Cannot connect to OPC UA server – cannot log watchdog")
+        sys.exit(1)
+    
+    watchdog_node_id = cfg.get("watchdog_id", "ns=2;i=7")
     log.info("Logging watchdog value for %d seconds …", duration)
 
     try:
         while time.time() - start < duration:
             try:
-                # Read watchdog node with robust reconnection
-                watchdog_val = read_node_robust(cfg.get("watchdog_id", "ns=2;i=7"), ua, max_retries=3, reconnect_delay=1)
+                val = ua.get_node(watchdog_node_id).get_value()
                 now = datetime.now(timezone.utc)
                 elapsed = time.time() - start
 
-                if watchdog_val is not None:
-                    point = ("Alpakralle", {"value": 1 if watchdog_val else 0, "raw": bool(watchdog_val)}, now)
-                    write_api.write(bucket=influx_bucket, record=point)
-                    point_count += 1
+                point = ("Alpakralle", {"value": 1 if val else 0, "raw": bool(val)}, now)
+                write_api.write(bucket=influx_bucket, record=point)
+                point_count += 1
 
-                    status = "✗" if watchdog_val else "✓"
-                    log.info("[%6.1fs]  %s  | %s  (points: %d)", elapsed, status, watchdog_val, point_count)
-                else:
-                    log.warning("[%6.1fs]  ⚠️  Could not read watchdog value", elapsed)
+                status = "✗" if val else "✓"
+                log.info("[%6.1fs]  %s  | %s  (points: %d)", elapsed, status, val, point_count)
             except Exception as exc:
-                log.warning("[%6.1fs]  OPC UA read failed (%s) – continuing …", time.time() - start, exc)
-            time.sleep(1)
+                log.warning("[%6.1fs]  OPC UA read failed (%s) – reconnecting …", time.time() - start, exc)
+                try:
+                    ua.disconnect()
+                except:
+                    pass
+                # Reconnect with backoff
+                reconnect_delay = 1
+                for r in range(1, 11):
+                    try:
+                        ua = get_ua_client()
+                        log.info("  Reconnected (attempt %d)", r)
+                        break
+                    except Exception as re:
+                        log.warning("  Reconnect failed (attempt %d): %s", r, re)
+                        if r < 10:
+                            time.sleep(reconnect_delay)
+                            reconnect_delay = min(reconnect_delay * 2, 8)
+        else:
+            # Normal exit – duration reached
+            pass
 
     finally:
         elapsed_total = time.time() - start
