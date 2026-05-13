@@ -27,9 +27,39 @@ logging.basicConfig(
 log = logging.getLogger("scavenger")
 
 
+def get_ua_client() -> Client:
+    """Create and connect a fresh OPC UA client."""
+    ua = Client("opc.tcp://challenge.prekit.ch:4840")
+    ua.timeout = 10
+    ua.connect()
+    log.info("Connected to OPC UA server")
+    return ua
+
+
+def read_node_robust(node_id, ua, max_retries=5, reconnect_delay=2):
+    """
+    Read a single OPC UA node with automatic reconnection on failure.
+    Returns the value or None after exhausting retries.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            return ua.get_node(node_id).get_value()
+        except Exception as exc:
+            log.warning("  Node %s read failed (attempt %d/%d): %s", node_id, attempt, max_retries, exc)
+            if attempt < max_retries:
+                try:
+                    ua.disconnect()
+                except:
+                    pass
+                time.sleep(reconnect_delay)
+                ua = get_ua_client()
+    log.error("  Failed to read node %s after %d attempts", node_id, max_retries)
+    return None
+
+
 # ── OPC UA helpers ──────────────────────────────────────────────────────────────────
 
-def extract_config_from_opcua(ua: Client) -> dict:
+def extract_config_from_opcua() -> dict:
     """Pull every configuration value from the OPC UA server at runtime."""
     ns = "ns=2"          # challenge namespace
     cfg = {}
@@ -42,10 +72,25 @@ def extract_config_from_opcua(ua: Client) -> dict:
         "instructions": f"{ns};i=6",
         "watchdog_id":  f"{ns};i=7",
     }
+    
+    # Start with a fresh connection
+    ua = get_ua_client()
+    
     for key, node_id in mapping.items():
-        val = ua.get_node(node_id).get_value()
-        cfg[key] = val
-        log.info("  OPC UA  %-14s → %s", key, val)
+        val = read_node_robust(node_id, ua, max_retries=5, reconnect_delay=2)
+        if val is not None:
+            cfg[key] = val
+            log.info("  OPC UA  %-14s → %s", key, val)
+        else:
+            log.error("  Could not read OPC UA node %s", key)
+            # Keep trying to get remaining values
+            ua = get_ua_client()
+    
+    try:
+        ua.disconnect()
+    except:
+        pass
+    
     return cfg
 
 
@@ -137,21 +182,16 @@ def listen_for_mqtt_credentials(cfg: dict) -> dict:
 def main():
     log.info("═══ Alpamayo Digital Scavenger Hunt — START ═══")
 
-    # 1. OPC UA connection & config extraction
-    ua = Client("opc.tcp://challenge.prekit.ch:4840")
-    ua.timeout = 10
-    ua.connect()
-    log.info("Connected to OPC UA server")
-
-    cfg = extract_config_from_opcua(ua)
+    # 1. OPC UA connection & config extraction (with robust reconnection)
+    cfg = extract_config_from_opcua()
 
     # 2. MQTT discovery (optional but recommended)
     cred_cfg = listen_for_mqtt_credentials(cfg)
 
     # 3. InfluxDB connection
     influx_url = cred_cfg["influx_url"]
-    influx_org = cfg["influx_org"] or "alpamayo"
-    influx_bucket = cfg["influx_bucket"] or "alpamayo"
+    influx_org = cfg.get("influx_org") or "alpamayo"
+    influx_bucket = cfg.get("influx_bucket") or "alpamayo"
     influx_token = cred_cfg["influx_token"]
 
     log.info("Connecting to InfluxDB %s org=%s bucket=%s", influx_url, influx_org, influx_bucket)
@@ -159,40 +199,43 @@ def main():
     write_api = inf.write_api(write_options=SYNCHRONOUS)
     log.info("Connected to InfluxDB")
 
-    # 4. Watchdog node handle
-    watchdog_node = ua.get_node(cfg["watchdog_id"])
-    initial = watchdog_node.get_value()
-    log.info("Initial watchdog value: %s", initial)
-
-    # 5. Measurement name (use initials — replace here, or pass via env)
-    measurement = "Alpakralle"  # AlpaKralle
-
-    # 6. 60-second logging loop
+    # 4. 60-second logging loop with robust OPC UA reconnection
     start = time.time()
     duration = 60
     point_count = 0
-    log.info("Logging %s watchdog value for %d seconds …", measurement, duration)
+    
+    # Connect fresh for the monitoring phase
+    ua = get_ua_client()
+    
+    log.info("Logging watchdog value for %d seconds …", duration)
 
     try:
         while time.time() - start < duration:
             try:
-                val = watchdog_node.get_value()
+                # Read watchdog node with robust reconnection
+                watchdog_val = read_node_robust(cfg.get("watchdog_id", "ns=2;i=7"), ua, max_retries=3, reconnect_delay=1)
                 now = datetime.now(timezone.utc)
                 elapsed = time.time() - start
 
-                point = (measurement, {"value": 1 if val else 0, "raw": bool(val)}, now)
-                write_api.write(bucket=influx_bucket, record=point)
-                point_count += 1
+                if watchdog_val is not None:
+                    point = ("Alpakralle", {"value": 1 if watchdog_val else 0, "raw": bool(watchdog_val)}, now)
+                    write_api.write(bucket=influx_bucket, record=point)
+                    point_count += 1
 
-                status = "✗" if val else "✓"
-                log.info("[%6.1fs]  %s  | %s  (points: %d)", elapsed, status, val, point_count)
+                    status = "✗" if watchdog_val else "✓"
+                    log.info("[%6.1fs]  %s  | %s  (points: %d)", elapsed, status, watchdog_val, point_count)
+                else:
+                    log.warning("[%6.1fs]  ⚠️  Could not read watchdog value", elapsed)
             except Exception as exc:
-                log.warning("OPC UA read failed (%s) – continuing …", exc)
+                log.warning("[%6.1fs]  OPC UA read failed (%s) – continuing …", time.time() - start, exc)
             time.sleep(1)
 
     finally:
         elapsed_total = time.time() - start
-        ua.disconnect()
+        try:
+            ua.disconnect()
+        except:
+            pass
         inf.close()
 
     log.info("═══════════════════════════════════════════════════")
